@@ -1,0 +1,318 @@
+diff --git a/build.sbt b/build.sbt
+index 76c7552b7..06027aeec 100755
+--- a/build.sbt
++++ b/build.sbt
+@@ -310,6 +310,7 @@ lazy val executor = (project in file("executor"))
+       sparkDeps.map(_ % Provided) ++
+       metrics ++
+       jacksonDeps ++
++      hiveJdbcDeps ++
+       Seq(
+         jacksonCsv,
+         scalariform,
+diff --git a/common/src/main/scala/raw/RDBMSDatabase.scala b/common/src/main/scala/raw/RDBMSDatabase.scala
+index 22d368410..a75b64352 100644
+--- a/common/src/main/scala/raw/RDBMSDatabase.scala
++++ b/common/src/main/scala/raw/RDBMSDatabase.scala
+@@ -14,7 +14,9 @@ import raw.utils.JsonMappers
+   include = JsonTypeInfo.As.PROPERTY)
+ //  property = "type")
+ @JsonSubTypes(Array(
+-  new JsonType(value = classOf[PostgresqlDatabase], name = RDBMSDatabase.POSTGRESQL)
++  new JsonType(value = classOf[PostgresqlDatabase], name = RDBMSDatabase.POSTGRESQL),
++  new JsonType(value = classOf[ApacheHiveDatabase], name = RDBMSDatabase.HIVE)
++
+ ))
+ sealed abstract class RDBMSDatabase {
+   val name: String
+@@ -44,6 +46,19 @@ case class PostgresqlDatabase(override val name: String,
+   @JsonIgnore override def getConnectionString(): String = s"jdbc:postgresql://${host}:${port}/${database}"
+ }
+ 
++case class ApacheHiveDatabase(override val name: String,
++                              override val host: String,
++                              override val port: Int,
++                              override val database: String,
++                              override val username: Option[String],
++                              override val password: Option[String],
++                              override val properties: Map[String, String] = Map.empty) extends RDBMSDatabase {
++
++  @JsonIgnore override val driver = "org.apache.hive.jdbc.HiveDriver"
++  @JsonIgnore override val vendor: String = RDBMSDatabase.HIVE
++
++  @JsonIgnore override def getConnectionString(): String = s"jdbc:hive2://${host}:${port}/${database}"
++}
+ 
+ object RDBMSDatabase extends StrictLogging {
+ 
+@@ -51,12 +66,14 @@ object RDBMSDatabase extends StrictLogging {
+   final val POSTGRESQL = "postgresql"
+   final val MYSQL = "mysql"
+   final val ORACLE = "oracle"
++  final val HIVE = "apache-hive"
+ 
+   // TODO: Very weird... and error prone. Some things are optional? Nothing is type checked. Remove and create targe object instead!
+   def apply(name: String, vendor: String, host: String, port: Int, database: String,
+             username: Option[String], password: Option[String]): RDBMSDatabase = {
+     vendor match {
+       case POSTGRESQL => PostgresqlDatabase(name, host, port, database, username, password)
++      case HIVE => ApacheHiveDatabase(name, host, port, database, username, password)
+       case _ => throw new IllegalArgumentException("Unknown database vendor: " + vendor)
+     }
+   }
+diff --git a/executor/src/main/scala/raw/compiler/RDBMSPushdown.scala b/executor/src/main/scala/raw/compiler/RDBMSPushdown.scala
+index d75b7c7db..820c5196f 100644
+--- a/executor/src/main/scala/raw/compiler/RDBMSPushdown.scala
++++ b/executor/src/main/scala/raw/compiler/RDBMSPushdown.scala
+@@ -6,6 +6,7 @@ import raw.compiler.base.Counter
+ import raw.{QueryContext, Ready}
+ import raw.compiler.base.source.SourceTree.SourceTree
+ import raw.location.RDBMSTable
++import raw.usermng.client.UserManagers
+ //import org.bitbucket.inkytonik.kiama.rewriting.Rewriter._
+ import raw.compiler.L0.source._
+ import raw.compiler.L1.source._
+@@ -54,13 +55,27 @@ trait SQLPrettyPrinter extends raw.compiler.L4.source.SourcePrettyPrinter {
+   }
+ }
+ 
++trait HiveSqlPrettyPrinter extends SQLPrettyPrinter {
++  protected override def toDoc(n: BaseNode): Doc = n match {
++    case IdnUse("*") => "*"
++    case RecordProj(e, idn) => e <> "." <> "`" <> idn <> "`"
++    case i: IdnNode => "`" <> i.idn <> "`"
++    case _ => super.toDoc(n)
++  }
++}
++
+ object SQLPrettyPrinter {
+   def apply(e: Exp): String = {
+     new SQLPrettyPrinter {}.format(e)
+   }
++  def hive2(e: Exp): String = {
++    new HiveSqlPrettyPrinter {}.format(e)
++  }
+ }
+ 
+-private case class TempRDBMSScan(dbName: String, s: Select, t: Type) extends Exp
++
++
++private case class TempRDBMSScan(dbName: String, s: Select, t: Type, vendor: String) extends Exp
+ 
+ trait RDBMSPushdown extends Transformer with Utils {
+ 
+@@ -77,8 +92,16 @@ trait RDBMSPushdown extends Transformer with Utils {
+             RecordType(atts.filter(a => columns.contains(a.idn)))
+           case None => fullType
+         }
++
++        val server = UserManagers(queryContext.settings)
++            .getClient(queryContext.user)
++            .getRDBMSServer(table.dbName)
++            .getOrElse(
++              throw new IllegalArgumentException("Could not find database entry for: " + queryContext.user + " " + table.dbName)
++            )
++        val vendor = vendorFromConnStr(server.connectionString)
+         logger.debug(s"Inner type here is $innerType")
+-        TempRDBMSScan(table.dbName, scan(table.schema, table.table, maybeColumns), IteratorType(innerType)) // this makes (correctly) an iterator of collections
++        TempRDBMSScan(table.dbName, scan(table.schema, table.table, maybeColumns), IteratorType(innerType), vendor) // this makes (correctly) an iterator of collections
+     }
+ 
+     //val transform = (everywhere(doRdbmsScan) <* reduce(pushToRdbms ) <* everywhere(generateSql)) // reduce(pushToRdbms + simplifyExp)
+@@ -87,9 +110,19 @@ trait RDBMSPushdown extends Transformer with Utils {
+     super.transform(rewriteTree(transform)(tree))
+   }
+ 
++  def vendorFromConnStr(s: String) = {
++      s.substring(5, s.indexOf(":", 5))
++  }
++
+   private lazy val generateSql = rule[Exp] {
+-    case TempRDBMSScan(dbName, s, t) =>
+-      val scan = RDBMSScan(dbName, SQLPrettyPrinter(s), t)
++    case TempRDBMSScan(dbName, s, t, vendor) =>
++      val sql = vendor match {
++        case "hive2" =>
++          SQLPrettyPrinter.hive2(s)
++        case _ =>
++          SQLPrettyPrinter(s)
++      }
++      val scan = RDBMSScan(dbName, sql, t)
+       logger.debug(s"t here is $t")
+       t match {
+         case IteratorType(_) => CIteratorToList(scan)
+diff --git a/executor/src/main/scala/raw/inputformats/rdbms/RDBMSInferrer.scala b/executor/src/main/scala/raw/inputformats/rdbms/RDBMSInferrer.scala
+index 96917ac50..1a219ac03 100644
+--- a/executor/src/main/scala/raw/inputformats/rdbms/RDBMSInferrer.scala
++++ b/executor/src/main/scala/raw/inputformats/rdbms/RDBMSInferrer.scala
+@@ -3,7 +3,7 @@ package raw.inputformats.rdbms
+ import com.typesafe.scalalogging.StrictLogging
+ import raw._
+ import raw.compiler.L4.source._
+-import raw.compiler.base.source.{AnyType, AttrType}
++import raw.compiler.base.source._
+ import raw.inputformats.spi.inferrer.{FailedInference, InferrerResult, InferrerServices, SuccessfulInference}
+ import raw.location.RDBMSTable
+ import raw.model.AuthenticatedUser
+@@ -15,35 +15,16 @@ import scala.collection.mutable
+ object RDBMSInferrer extends StrictLogging {
+ 
+   def apply(user: AuthenticatedUser, location: RDBMSTable)(implicit inferrerServices: InferrerServices): InferrerResult = {
++
+     val database = inferrerServices.getDatabase(user, location.dbName)
+     try {
+       val conn = RDBMSUtils.getConnection(database.connectionString, database.username, database.password)
+       try {
+-        val metaData = conn.getMetaData
+-        val res = metaData.getColumns(
+-          null, // Database/Catalog is set to null because we assume it is already set as part of the connection string
+-          location.schema,
+-          location.table,
+-          null // Read all columns
+-        )
+-        val columns = mutable.ListBuffer[AttrType]()
+-        while (res.next) {
+-          val t = res.getInt("DATA_TYPE") match {
+-            case java.sql.Types.TINYINT | java.sql.Types.SMALLINT | java.sql.Types.INTEGER => SqlIntType(res.getInt("NULLABLE") == 1)
+-            case java.sql.Types.BIGINT => SqlLongType(res.getInt("NULLABLE") == 1)
+-            case java.sql.Types.FLOAT |  java.sql.Types.REAL => SqlFloatType(res.getInt("NULLABLE") == 1)
+-            case java.sql.Types.DECIMAL | java.sql.Types.NUMERIC => SqlDecimalType(res.getInt("NULLABLE") == 1)
+-            case java.sql.Types.DOUBLE => SqlDoubleType(res.getInt("NULLABLE") == 1)
+-            case java.sql.Types.CHAR | java.sql.Types.VARCHAR => SqlStringType(res.getInt("NULLABLE") == 1)
+-            case java.sql.Types.BOOLEAN | java.sql.Types.BIT => SqlBoolType(res.getInt("NULLABLE") == 1)
+-            case java.sql.Types.DATE => SqlDateType(res.getInt("NULLABLE") == 1)
+-            case java.sql.Types.TIME | java.sql.Types.TIME_WITH_TIMEZONE => SqlTimeType(res.getInt("NULLABLE") == 1)
+-            case java.sql.Types.TIMESTAMP | java.sql.Types.TIMESTAMP_WITH_TIMEZONE => SqlTimestampType(res.getInt("NULLABLE") == 1)
+-            case java.sql.Types.OTHER => AnyType()
+-          }
+-          columns += AttrType(res.getString("COLUMN_NAME"), t)
++        val dataType =  if (database.connectionString.startsWith("jdbc:hive2")) {
++          getHiveType(conn, location)
++        } else {
++          getRDBMSType(conn, location)
+         }
+-        val dataType = SqlCollectionType(SqlRecordType(columns.to, nullable = false), nullable = false)
+         SuccessfulInference(RDBMSSource().toInputSourceNode, dataType)
+       } finally {
+         conn.close()
+@@ -54,4 +35,51 @@ object RDBMSInferrer extends StrictLogging {
+ 
+   }
+ 
++  def getRDBMSType(conn: java.sql.Connection, location: RDBMSTable): Type = {
++    val metaData = conn.getMetaData
++    val res = metaData.getColumns(
++      null, // Database/Catalog is set to null because we assume it is already set as part of the connection string
++      location.schema,
++      location.table,
++      null // Read all columns
++    )
++    val columns = mutable.ListBuffer[AttrType]()
++    while (res.next) {
++      val t = res.getInt("DATA_TYPE") match {
++        case java.sql.Types.TINYINT | java.sql.Types.SMALLINT | java.sql.Types.INTEGER => SqlIntType(res.getInt("NULLABLE") == 1)
++        case java.sql.Types.BIGINT => SqlLongType(res.getInt("NULLABLE") == 1)
++        case java.sql.Types.FLOAT |  java.sql.Types.REAL => SqlFloatType(res.getInt("NULLABLE") == 1)
++        case java.sql.Types.DECIMAL | java.sql.Types.NUMERIC => SqlDecimalType(res.getInt("NULLABLE") == 1)
++        case java.sql.Types.DOUBLE => SqlDoubleType(res.getInt("NULLABLE") == 1)
++        case java.sql.Types.CHAR | java.sql.Types.VARCHAR => SqlStringType(res.getInt("NULLABLE") == 1)
++        case java.sql.Types.BOOLEAN | java.sql.Types.BIT => SqlBoolType(res.getInt("NULLABLE") == 1)
++        case java.sql.Types.DATE => SqlDateType(res.getInt("NULLABLE") == 1)
++        case java.sql.Types.TIME | java.sql.Types.TIME_WITH_TIMEZONE => SqlTimeType(res.getInt("NULLABLE") == 1)
++        case java.sql.Types.TIMESTAMP | java.sql.Types.TIMESTAMP_WITH_TIMEZONE => SqlTimestampType(res.getInt("NULLABLE") == 1)
++        case java.sql.Types.OTHER => AnyType()
++      }
++      columns += AttrType(res.getString("COLUMN_NAME"), t)
++    }
++    SqlCollectionType(SqlRecordType(columns.to, nullable = false), nullable = false)
++  }
++
++  def getHiveType(conn: java.sql.Connection, location: RDBMSTable): Type = {
++    val statement = conn.createStatement()
++    val resultSet = statement.executeQuery(s"DESCRIBE ${location.table}")
++    val columns = mutable.ListBuffer[AttrType]()
++    while (resultSet.next()) {
++      val name = resultSet.getString("col_name")
++      //TODO: add more types
++      val t = resultSet.getString("data_type") match {
++        case "int" => IntType()
++        case "string" => StringType()
++        case "bigint" => LongType()
++        case "timestamp" => TimestampType()
++        case "date" => DateType()
++      }
++      columns += AttrType(name, t)
++    }
++    SqlCollectionType(SqlRecordType(columns.to, nullable = false), nullable = false)
++  }
++
+ }
+diff --git a/executor/src/test/scala/raw/executor/HiveJdbcTest.scala b/executor/src/test/scala/raw/executor/HiveJdbcTest.scala
+new file mode 100644
+index 000000000..d6ff68195
+--- /dev/null
++++ b/executor/src/test/scala/raw/executor/HiveJdbcTest.scala
+@@ -0,0 +1,33 @@
++package raw.executor
++
++import raw.RDBMSDatabase
++
++import org.apache.hive.jdbc.HiveDriver
++/**
++  * Created by cesar on 29.03.17.
++  */
++class HiveJdbcTest extends NewStyleExecutorTest {
++
++  // this test expects a spark instance with a thrift-server to be started already
++  //check  https://github.com/torcato/spark-jdbc-test-docker
++  val testDb = RDBMSDatabase("foo", RDBMSDatabase.HIVE, "localhost", 10000, "default", Some("root"), None)
++
++  rdbms("test1", testDb, "default", "table1")
++  rdbms("test2", testDb, "default", "table2")
++
++  rdbmsStmts(testDb,
++    "rdbmstest",
++    """CREATE TABLE IF NOT EXISTS default.table1 (id INT, name VARCHAR)""",
++    """CREATE TABLE IF NOT EXISTS default.table2 (id INT, name VARCHAR)""",
++    // The insert statements do not actually insert data
++    //TODO: create data that can be accessed from the jdbc connection before
++    """INSERT INTO table1 VALUES (1, 'John')""",
++    """INSERT INTO table1 VALUES (2, 'Jane')""",
++    """INSERT INTO table2 VALUES (1, 'Doe')""",
++    """INSERT INTO table2 VALUES (2, 'Doe')"""
++  )
++
++  test("select * from test1") { x =>
++    x should evaluateTo("""collection()""")
++  }
++}
+diff --git a/executor/src/test/scala/raw/executor/NewStyleExecutorTest.scala b/executor/src/test/scala/raw/executor/NewStyleExecutorTest.scala
+index e36069822..3e64c5666 100644
+--- a/executor/src/test/scala/raw/executor/NewStyleExecutorTest.scala
++++ b/executor/src/test/scala/raw/executor/NewStyleExecutorTest.scala
+@@ -192,7 +192,13 @@ class NewStyleExecutorTest extends L4.CompilerTestSuite with TestBuckets with Be
+       }
+     }
+     rdbmsSchemas.foreach { case (server, schemas) =>
+-      sendRdbmsStmts(server, schemas.map(schema => s"DROP SCHEMA $schema CASCADE").to)
++      if (server.vendor == "apache-hive") {
++        //here we have to drop the tables,
++        // TODO: check how to do get all registered tables and drop them
++      } else {
++        sendRdbmsStmts(server, schemas.map(schema => s"DROP SCHEMA $schema CASCADE").to)
++      }
++
+     }
+     super.afterAll()
+   }
+diff --git a/project/Dependencies.scala b/project/Dependencies.scala
+index e37caa221..694bfb426 100755
+--- a/project/Dependencies.scala
++++ b/project/Dependencies.scala
+@@ -200,4 +200,6 @@ object Dependencies {
+   val icuDeps = Seq(
+     "com.ibm.icu" % "icu4j" % "58.2"
+   )
++
++  val hiveJdbcDeps = Seq("org.spark-project.hive" % "hive-jdbc" % "1.2.1.spark2")
+ }
